@@ -196,6 +196,7 @@ if (isset($_GET['keywords']) AND $can_read) {
   if (empty($zserver)) die('<div class="errorBox">'. __('Current z3950 SRU address is not register in database!') .'</div>');
 
   require LIB.'modsxmlslims.inc.php';
+  require LIB.'marcxmlslims.inc.php';
   $_SESSION['z3950result'] = array();
   if ($_GET['index'] != 0) {
     $index = trim($_GET['index']).'=';
@@ -211,9 +212,31 @@ if (isset($_GET['keywords']) AND $can_read) {
       $_SESSION['z3950sru_id'] = $matchServer['id'];
     }
 
-    $sru_server = $zserver.'?version=1.1&operation=searchRetrieve&query='.$keywords.'&startRecord=1&maximumRecords=20&recordSchema=mods';
-    // parse SRU Server XML
-    $sru_xml = new SimpleXMLElement($sru_server, LIBXML_NSCLEAN, true);
+    // Try to fetch with MARCXML first, then fallback to MODS
+    $sru_server = $zserver.'?version=1.1&operation=searchRetrieve&query='.$keywords.'&startRecord=1&maximumRecords=20&recordSchema=marcxml';
+    // parse SRU Server XML - suppress errors for initial attempt
+    $sru_xml = @new SimpleXMLElement($sru_server, LIBXML_NSCLEAN, true);
+    
+    // Check if we got a valid response with MARCXML
+    $use_marcxml = false;
+    if ($sru_xml) {
+        $zs_xml_check = $sru_xml->children('http://www.loc.gov/zing/srw/');
+        if (isset($zs_xml_check->records->record)) {
+            foreach ($zs_xml_check->records->record as $rec_check) {
+                if (isset($rec_check->recordData->record)) {
+                    $use_marcxml = true;
+                    break;
+                }
+            }
+        }
+    }
+    
+    // If MARCXML didn't work, try MODS
+    if (!$use_marcxml) {
+        $sru_server = $zserver.'?version=1.1&operation=searchRetrieve&query='.$keywords.'&startRecord=1&maximumRecords=20&recordSchema=mods';
+        $sru_xml = new SimpleXMLElement($sru_server, LIBXML_NSCLEAN, true);
+    }
+    
     // below is for debugging purpose
     // echo '<pre>'; var_dump($sru_xml); echo '</pre>'; exit();
     $zs_xml = $sru_xml->children('http://www.loc.gov/zing/srw/');
@@ -234,13 +257,31 @@ if (isset($_GET['keywords']) AND $can_read) {
 
       $row = 1;
       foreach ($zs_xml->records->record as $rec) {
-        // echo '<pre>'; var_dump($rec->recordData->children()); echo '</pre>';
-        $mods = modsXMLslims($rec->recordData->children()->mods);
+        // Detect format and parse accordingly
+        if (isset($rec->recordData->record)) {
+            // MARCXML format
+            $parsed_record = marcXMLslims($rec->recordData->record);
+        } else if (isset($rec->recordData->mods)) {
+            // MODS format
+            $parsed_record = modsXMLslims($rec->recordData->mods);
+        } else {
+            // Try to auto-detect from children
+            $record_data = $rec->recordData->children();
+            $root_name = $record_data->getName();
+            if ($root_name == 'record') {
+                $parsed_record = marcXMLslims($record_data);
+            } else if ($root_name == 'mods') {
+                $parsed_record = modsXMLslims($record_data);
+            } else {
+                continue; // Skip unknown format
+            }
+        }
+        
         // save it to session vars for retrieving later
-        $_SESSION['z3950result'][$row] = $mods;
+        $_SESSION['z3950result'][$row] = $parsed_record;
 
         // authors
-        $authors = array(); foreach ($mods['authors']??[] as $auth) { $authors[] = $auth['name']; }
+        $authors = array(); foreach ($parsed_record['authors']??[] as $auth) { $authors[] = $auth['name']; }
 
         $row_class = ($row%2 == 0)?'alterCell':'alterCell2';
 
@@ -248,17 +289,17 @@ if (isset($_GET['keywords']) AND $can_read) {
 
         $title_content = '<div class="media">
                       <div class="media-body">
-                        <div class="title">'.stripslashes($mods['title']).'</div><div class="authors">'.implode(' - ', $authors).'</div>
+                        <div class="title">'.stripslashes($parsed_record['title']).'</div><div class="authors">'.implode(' - ', $authors).'</div>
                       </div>
                     </div>';
 
         $table->appendTableRow(array($cb,
           $title_content,
-          ($mods['isbn_issn']??'-'),
-          ($mods['gmd']??'-'),
-          ($mods['collation']??'-'),
-          ($mods['publisher']??'-'),
-          ($mods['publish_year']??'-'),
+          ($parsed_record['isbn_issn']??'-'),
+          ($parsed_record['gmd']??'-'),
+          ($parsed_record['collation']??'-'),
+          ($parsed_record['publisher']??'-'),
+          ($parsed_record['publish_year']??'-'),
         ));
         // set cell attribute
         $row_class = ($row%2 == 0)?'alterCell':'alterCell2';
