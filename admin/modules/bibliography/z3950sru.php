@@ -214,37 +214,30 @@ if (isset($_GET['keywords']) AND $can_read) {
 
     // Try to fetch with MARCXML first, then fallback to MODS
     $sru_server = $zserver.'?version=1.1&operation=searchRetrieve&query='.$keywords.'&startRecord=1&maximumRecords=20&recordSchema=marcxml';
-    // parse SRU Server XML - suppress errors for initial attempt
-    $sru_xml = @new SimpleXMLElement($sru_server, LIBXML_NSCLEAN, true);
+    
+    // Use DOMDocument for better namespace handling
+    libxml_use_internal_errors(true);
+    $sru_dom = new DOMDocument();
+    $sru_dom->load($sru_server);
     
     // Check if we got a valid response with MARCXML
     $use_marcxml = false;
-    if ($sru_xml) {
-        $zs_xml_check = $sru_xml->children('http://www.loc.gov/zing/srw/');
-        if (isset($zs_xml_check->records->record)) {
-            foreach ($zs_xml_check->records->record as $rec_check) {
-                if (isset($rec_check->recordData->record)) {
-                    $use_marcxml = true;
-                    break;
-                }
-                // Also check for record in children (namespace handling)
-                if (isset($rec_check->recordData)) {
-                    $record_children = $rec_check->recordData->children();
-                    foreach ($record_children as $child_name => $child) {
-                        if ($child_name == 'record') {
-                            $use_marcxml = true;
-                            break 2;
-                        }
-                    }
-                }
-            }
+    if ($sru_dom) {
+        $xpath = new DOMXPath($sru_dom);
+        $xpath->registerNamespace('zs', 'http://www.loc.gov/zing/srw/');
+        $xpath->registerNamespace('marc', 'http://www.loc.gov/MARC21/slim');
+        
+        $records = $xpath->query('//zs:records//marc:record');
+        if ($records && $records->length > 0) {
+            $use_marcxml = true;
         }
     }
     
     // If MARCXML didn't work, try MODS
     if (!$use_marcxml) {
         $sru_server = $zserver.'?version=1.1&operation=searchRetrieve&query='.$keywords.'&startRecord=1&maximumRecords=20&recordSchema=mods';
-        $sru_xml = new SimpleXMLElement($sru_server, LIBXML_NSCLEAN, true);
+        $sru_dom = new DOMDocument();
+        $sru_dom->load($sru_server);
     }
     
     // below is for debugging purpose
@@ -260,8 +253,15 @@ if (isset($_GET['keywords']) AND $can_read) {
     //     echo '</pre>'; 
     //     exit();
     // }
-    $zs_xml = $sru_xml->children('http://www.loc.gov/zing/srw/');
-    $hits = $zs_xml->numberOfRecords;
+    // Setup XPath for processing
+    $xpath = new DOMXPath($sru_dom);
+    $xpath->registerNamespace('zs', 'http://www.loc.gov/zing/srw/');
+    $xpath->registerNamespace('marc', 'http://www.loc.gov/MARC21/slim');
+    $xpath->registerNamespace('mods', 'http://www.loc.gov/mods/v3');
+    
+    // Get number of hits
+    $hits_node = $xpath->query('//zs:numberOfRecords')->item(0);
+    $hits = $hits_node ? (int)$hits_node->textContent : 0;
 
     if ($hits > 0) {
       echo '<div class="infoBox">' . str_replace('{hits}', $hits,__('Found {hits} records from Z3950 SRU Server.')) . '</div>';
@@ -282,44 +282,33 @@ if (isset($_GET['keywords']) AND $can_read) {
       // Debug: Log parsing issues
       $parse_errors = array();
       
-      foreach ($zs_xml->records->record as $rec) {
+      // Process records using XPath
+      $records = $xpath->query('//zs:records//zs:record');
+      
+      foreach ($records as $rec) {
         // Detect format and parse accordingly
         $parsed_record = null;
         
-        if (isset($rec->recordData->record)) {
-            // MARCXML format - need to handle namespace
-            $marc_record = $rec->recordData->record;
-            // Get MARC21 namespace if present
-            $namespaces = $marc_record->getNamespaces(true);
-            if (!empty($namespaces[''])) {
-                // Access children with the MARC21 namespace
-                $marc_record_with_ns = $marc_record->children($namespaces['']);
-                $parsed_record = marcXMLslims($marc_record_with_ns);
-            } else {
-                $parsed_record = marcXMLslims($marc_record);
+        // Try MARCXML first
+        $marc_records = $xpath->query('.//marc:record', $rec);
+        if ($marc_records && $marc_records->length > 0) {
+            // MARCXML format
+            $marc_record = $marc_records->item(0);
+            // Convert to SimpleXMLElement for our parser
+            $marc_xml_str = $sru_dom->saveXML($marc_record);
+            $marc_sxe = simplexml_load_string($marc_xml_str);
+            if ($marc_sxe) {
+                $parsed_record = marcXMLslims($marc_sxe);
             }
-        } else if (isset($rec->recordData->mods)) {
-            // MODS format
-            $parsed_record = modsXMLslims($rec->recordData->mods);
         } else {
-            // Try to auto-detect from children
-            $record_data_children = $rec->recordData->children();
-            if ($record_data_children && count($record_data_children) > 0) {
-                foreach ($record_data_children as $child_name => $child) {
-                    if ($child_name == 'record') {
-                        // MARCXML with namespace detection
-                        $namespaces = $child->getNamespaces(true);
-                        if (!empty($namespaces[''])) {
-                            $marc_record_with_ns = $child->children($namespaces['']);
-                            $parsed_record = marcXMLslims($marc_record_with_ns);
-                        } else {
-                            $parsed_record = marcXMLslims($child);
-                        }
-                        break;
-                    } else if ($child_name == 'mods') {
-                        $parsed_record = modsXMLslims($child);
-                        break;
-                    }
+            // Try MODS format
+            $mods_records = $xpath->query('.//mods:mods', $rec);
+            if ($mods_records && $mods_records->length > 0) {
+                $mods_record = $mods_records->item(0);
+                $mods_xml_str = $sru_dom->saveXML($mods_record);
+                $mods_sxe = simplexml_load_string($mods_xml_str);
+                if ($mods_sxe) {
+                    $parsed_record = modsXMLslims($mods_sxe);
                 }
             }
         }
@@ -364,7 +353,7 @@ if (isset($_GET['keywords']) AND $can_read) {
         $table->setCellAttr($row, 2, 'class="'.$row_class.'" valign="top" style="width: auto;"');
         $table->setCellAttr($row, 2, 'class="'.$row_class.'" valign="top" style="width: auto;"');
         $table->setCellAttr($row, 2, 'class="'.$row_class.'" valign="top" style="width: auto;"');
-        $table->setCellAttr($row, 2, 'class="'.$row_class.'" valign="top" style="width: auto;"');
+        $table->setCellAttr($row, 2, 'class="'.$row_class.'" valign="top" style="width: auto;"');      
         $table->setCellAttr($row, 2, 'class="'.$row_class.'" valign="top" style="width: auto;"');      
         $row++;
       }
@@ -372,91 +361,25 @@ if (isset($_GET['keywords']) AND $can_read) {
       // If no records were displayed, show a message with debug info
       if ($records_displayed == 0) {
           echo '<div class="errorBox">' . __('Records found but unable to parse. Please check the server response format.') . '</div>';
-          // Show parse errors for debugging (can be removed in production)
+          // Show debug info
           if (!empty($parse_errors)) {
-              echo '<div class="errorBox"><strong>Debug Info:</strong><ul>';
+              echo '<div class="infoBox"><strong>Debug Info:</strong><ul>';
               foreach ($parse_errors as $err) {
                   echo '<li>'.$err.'</li>';
               }
               echo '</ul></div>';
           }
       } else {
-          echo $table->printTable(); 
+          echo $table->printTable();
       }
-
-    } else if ($errors) {
-      echo '<div class="errorBox"><ul>';
-      foreach ($errors as $errmsg) {
-          echo '<li>'.$errmsg.'</li>';
-      }
-      echo '</ul></div>';
     } else {
-      echo '<div class="errorBox">' . __('No Results Found!') . '</div>';
+      echo '<div class="errorBox">'.__('No records found from Z3950 SRU Server.').'</div>';
     }
-  } else {
-    echo '<div class="errorBox">' . __('No Keywords Supplied!') . '</div>';
-  }
-  ?>
-  <script>
-    $('.save').on('click', function (e) {
-    var zrecord = {};
-    var uri = '<?php echo $_SERVER['PHP_SELF']; ?>';
-    $("input[type=checkbox]:checked").each(function() {
-       zrecord[$(this).val()] = $(this).val();
-    });
-
-    $.ajax({
-            url: uri,
-            type: 'post',
-            data: {saveResults: true, zrecord }
-        })
-          .done(function (msg) {
-            console.log(zrecord);
-            parent.toastr.success(Object.keys(zrecord).length+" records inserted into the database", "Z3950 Service");
-            parent.jQuery('#mainContent').simbioAJAX(uri)
-        })
-    })
-    $(".uncheck-all").on('click',function (e){
-        e.preventDefault()
-        $('[type=checkbox]').prop('checked', false);
-    });
-    $(".check-all").on('click',function (e){
-        e.preventDefault()
-        $('[type=checkbox]').prop('checked', true);
-    });
-</script>
-<?php
-  exit();
 }
 /* SEARCH OPERATION END */
 
-/* search form */
+// get HTML template for search form
+$main_content = $oai_pmh_tpl->fetch();
+// print out the content
 ?>
-<div class="menuBox">
-    <div class="menuBoxInner biblioIcon">
-        <div class="per_title">
-            <h2><?php echo __('Z3950 Search/Retrieve via URL (SRU)'); ?></h2>
-        </div>
-        <div class="sub_section">
-            <form name="search" id="search" action="<?php echo MWB; ?>bibliography/z3950sru.php"
-                  loadcontainer="searchResult" method="get" class="form-inline">
-                <span class="mr-2"><?php echo __('Search'); ?></span>
-                <input type="text" name="keywords" id="keywords" class="form-control col-md-3"/>
-                <select name="index" class="form-control">
-                    <option value="0"><?php echo __('All fields'); ?></option>
-                    <option value="bath.isbn"><?php echo __('ISBN/ISSN'); ?></option>
-                    <option value="dc.title"><?php echo __('Title/Series Title'); ?></option>
-                    <option value="bath.name"><?php echo __('Authors'); ?></option>
-                </select>
-                <span class="mx-2"><?php echo __('SRU Server'); ?>:</span>
-                <select name="z3950_SRU_source"
-                        class="form-control"><?php foreach ($sysconf['z3950_SRU_source'] as $serverid => $z3950_source) {
-                        echo '<option value="' . $z3950_source['uri'] . '">' . $z3950_source['name'] . '</option>';
-                    } ?></select>
-                <input type="submit" id="doSearch" value="<?php echo __('Search'); ?>" class="s-btn btn btn-default"/>
-            </form>
-        </div>
-        <div class="infoBox"><?php echo __('* Please make sure you have a working Internet connection.'); ?></div>
-    </div>
-</div>
-<div id="searchResult">&nbsp;</div>
+}
