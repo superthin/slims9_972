@@ -227,6 +227,16 @@ if (isset($_GET['keywords']) AND $can_read) {
                     $use_marcxml = true;
                     break;
                 }
+                // Also check for record in children (namespace handling)
+                if (isset($rec_check->recordData)) {
+                    $record_children = $rec_check->recordData->children();
+                    foreach ($record_children as $child_name => $child) {
+                        if ($child_name == 'record') {
+                            $use_marcxml = true;
+                            break 2;
+                        }
+                    }
+                }
             }
         }
     }
@@ -239,6 +249,17 @@ if (isset($_GET['keywords']) AND $can_read) {
     
     // below is for debugging purpose
     // echo '<pre>'; var_dump($sru_xml); echo '</pre>'; exit();
+    // Debug: Check XML structure
+    // if ($sru_xml) {
+    //     echo '<pre>'; 
+    //     echo "XML Structure:\n";
+    //     print_r($sru_xml);
+    //     echo "\n\nSRW Children:\n";
+    //     $debug_zs = $sru_xml->children('http://www.loc.gov/zing/srw/');
+    //     print_r($debug_zs);
+    //     echo '</pre>'; 
+    //     exit();
+    // }
     $zs_xml = $sru_xml->children('http://www.loc.gov/zing/srw/');
     $hits = $zs_xml->numberOfRecords;
 
@@ -256,26 +277,61 @@ if (isset($_GET['keywords']) AND $can_read) {
       $table->setCellAttr(0, 0, '');
 
       $row = 1;
+      $records_displayed = 0;
+      
+      // Debug: Log parsing issues
+      $parse_errors = array();
+      
       foreach ($zs_xml->records->record as $rec) {
         // Detect format and parse accordingly
+        $parsed_record = null;
+        
         if (isset($rec->recordData->record)) {
-            // MARCXML format
-            $parsed_record = marcXMLslims($rec->recordData->record);
+            // MARCXML format - need to handle namespace
+            $marc_record = $rec->recordData->record;
+            // Get MARC21 namespace if present
+            $namespaces = $marc_record->getNamespaces(true);
+            if (!empty($namespaces[''])) {
+                // Access children with the MARC21 namespace
+                $marc_record_with_ns = $marc_record->children($namespaces['']);
+                $parsed_record = marcXMLslims($marc_record_with_ns);
+            } else {
+                $parsed_record = marcXMLslims($marc_record);
+            }
         } else if (isset($rec->recordData->mods)) {
             // MODS format
             $parsed_record = modsXMLslims($rec->recordData->mods);
         } else {
             // Try to auto-detect from children
-            $record_data = $rec->recordData->children();
-            $root_name = $record_data->getName();
-            if ($root_name == 'record') {
-                $parsed_record = marcXMLslims($record_data);
-            } else if ($root_name == 'mods') {
-                $parsed_record = modsXMLslims($record_data);
-            } else {
-                continue; // Skip unknown format
+            $record_data_children = $rec->recordData->children();
+            if ($record_data_children && count($record_data_children) > 0) {
+                foreach ($record_data_children as $child_name => $child) {
+                    if ($child_name == 'record') {
+                        // MARCXML with namespace detection
+                        $namespaces = $child->getNamespaces(true);
+                        if (!empty($namespaces[''])) {
+                            $marc_record_with_ns = $child->children($namespaces['']);
+                            $parsed_record = marcXMLslims($marc_record_with_ns);
+                        } else {
+                            $parsed_record = marcXMLslims($child);
+                        }
+                        break;
+                    } else if ($child_name == 'mods') {
+                        $parsed_record = modsXMLslims($child);
+                        break;
+                    }
+                }
             }
         }
+        
+        // Skip if we couldn't parse the record
+        if (!$parsed_record || empty($parsed_record['title'])) {
+            // Log error for debugging
+            $parse_errors[] = "Row $row: Failed to parse record - " . ($parsed_record ? "Missing title" : "Parse returned null");
+            continue;
+        }
+        
+        $records_displayed++;
         
         // save it to session vars for retrieving later
         $_SESSION['z3950result'][$row] = $parsed_record;
@@ -313,7 +369,20 @@ if (isset($_GET['keywords']) AND $can_read) {
         $row++;
       }
 
-      echo $table->printTable(); 
+      // If no records were displayed, show a message with debug info
+      if ($records_displayed == 0) {
+          echo '<div class="errorBox">' . __('Records found but unable to parse. Please check the server response format.') . '</div>';
+          // Show parse errors for debugging (can be removed in production)
+          if (!empty($parse_errors)) {
+              echo '<div class="errorBox"><strong>Debug Info:</strong><ul>';
+              foreach ($parse_errors as $err) {
+                  echo '<li>'.$err.'</li>';
+              }
+              echo '</ul></div>';
+          }
+      } else {
+          echo $table->printTable(); 
+      }
 
     } else if ($errors) {
       echo '<div class="errorBox"><ul>';
